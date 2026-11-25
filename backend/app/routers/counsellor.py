@@ -117,12 +117,20 @@ def counsellor_chat(
         db.add(sess)
         db.flush()
 
+    prior_msgs = sorted(sess.messages, key=lambda m: m.id)[-6:] if payload.session_id else []
+    history = [{"role": m.role, "content": m.content[:600]} for m in prior_msgs]
+
     user_msg = ChatMessage(session_id=sess.id, role="user", content=payload.message.strip())
     db.add(user_msg)
     db.flush()
 
     orchestrator = AgentOrchestrator()
-    result = orchestrator.handle_query(db, current_user.id, payload.message.strip())
+    result = orchestrator.handle_query(
+        db,
+        current_user.id,
+        payload.message.strip(),
+        conversation_history=history,
+    )
 
     assistant_msg = ChatMessage(
         session_id=sess.id,
@@ -143,6 +151,7 @@ def counsellor_chat(
         "session_id": sess.id,
         "session_title": sess.title,
         "llm_mode": result["llm_mode"],
+        "orchestration_summary": result.get("orchestration_summary"),
         "message": {
             "id": assistant_msg.id,
             "role": "assistant",
@@ -161,9 +170,21 @@ def apply_agent_proposal(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    from app.models import Exam
+
+    valid_exam_ids = {row[0] for row in db.query(Exam.id).all()}
     if payload.proposal_type == "apply_study_plan":
         exam_id = payload.payload.get("exam_id")
         daily_hours = payload.payload.get("daily_hours")
+        if exam_id and exam_id not in valid_exam_ids:
+            raise HTTPException(status_code=400, detail=f"Unsupported exam_id: {exam_id}")
+        if daily_hours is not None:
+            try:
+                daily_hours = float(daily_hours)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid daily_hours value")
+            if not (0.5 <= daily_hours <= 16.0):
+                raise HTTPException(status_code=400, detail="daily_hours must be between 0.5 and 16.0")
         plan = build_adaptive_study_plan(
             db,
             current_user.id,
@@ -174,8 +195,10 @@ def apply_agent_proposal(
         return {"applied": True, "message": "Adaptive study plan updated and activated.", "plan": plan}
     if payload.proposal_type == "update_target_exam":
         exam_id = payload.payload.get("exam_id")
+        if not exam_id or exam_id not in valid_exam_ids:
+            raise HTTPException(status_code=400, detail=f"Unsupported exam_id: {exam_id}")
         profile = db.query(StudentProfile).filter(StudentProfile.user_id == current_user.id).first()
-        if profile and exam_id:
+        if profile:
             profile.primary_target_exam = exam_id
             db.commit()
             return {"applied": True, "message": f"Primary target exam updated to {exam_id}."}
