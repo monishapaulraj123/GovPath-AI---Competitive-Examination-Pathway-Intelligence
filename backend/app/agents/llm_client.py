@@ -1,6 +1,7 @@
 """
-Server-side External LLM Integration Client (OpenAI / Gemini) with structured JSON support,
-provider logging, configurable timeouts, and graceful deterministic fallback.
+Server-side Gemini LLM Integration Client with structured JSON support,
+provider logging, configurable timeouts, secret redaction, and graceful deterministic fallback.
+OpenAI is disabled in the active runtime; all active LLM workflows use Gemini.
 """
 
 from dataclasses import dataclass
@@ -41,37 +42,45 @@ def _redact_secrets(text: str, settings: Any) -> str:
 
 
 def _resolve_active_provider(settings: Any) -> tuple[str, str, bool]:
-    pref = (settings.LLM_PROVIDER or "auto").strip().lower()
+    pref = (settings.LLM_PROVIDER or "gemini").strip().lower()
     if pref in ("none", "disabled", "deterministic", "off"):
         return "grounded_deterministic", "GovPath Grounded Synthesis Engine", False
 
     if pref == "openai":
-        if settings.OPENAI_API_KEY:
-            return "openai", settings.OPENAI_MODEL, True
+        logger.warning("LLM_PROVIDER=openai requested, but OpenAI runtime calls are disabled; active runtime requires Gemini.")
         return "grounded_deterministic", "GovPath Grounded Synthesis Engine", False
 
-    if pref == "gemini":
+    if pref in ("gemini", "auto"):
         if settings.GEMINI_API_KEY:
-            return "gemini", settings.GEMINI_MODEL, True
+            model = (settings.GEMINI_MODEL or "gemini-2.5-flash").strip()
+            return "gemini", model, True
         return "grounded_deterministic", "GovPath Grounded Synthesis Engine", False
 
-    # auto mode
-    if settings.OPENAI_API_KEY:
-        return "openai", settings.OPENAI_MODEL, True
-    if settings.GEMINI_API_KEY:
-        return "gemini", settings.GEMINI_MODEL, True
+    logger.warning("Unsupported LLM_PROVIDER='%s'; falling back to deterministic mode.", pref)
     return "grounded_deterministic", "GovPath Grounded Synthesis Engine", False
 
 
 def get_llm_status() -> dict[str, Any]:
     settings = get_settings()
     provider, model, configured = _resolve_active_provider(settings)
+    pref = (settings.LLM_PROVIDER or "gemini").strip().lower()
+    reason = None
+    if not configured:
+        if pref == "openai":
+            reason = "OpenAI is disabled in active runtime; configure LLM_PROVIDER=gemini with GEMINI_API_KEY."
+        elif pref in ("none", "disabled", "deterministic", "off"):
+            reason = "LLM provider explicitly disabled."
+        else:
+            reason = "GEMINI_API_KEY is not configured."
+
     return {
         "configured": configured,
         "provider": provider,
         "model": model,
         "preferred_provider": settings.LLM_PROVIDER,
         "fallback_active": not configured,
+        "unavailable_reason": reason,
+        "openai_active": False,
     }
 
 
@@ -87,146 +96,128 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4) if text else 0
 
 
+def _extract_gemini_text(body: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    candidates = body.get("candidates") or []
+    if not candidates:
+        block_reason = body.get("promptFeedback", {}).get("blockReason")
+        if block_reason:
+            return None, f"Gemini prompt blocked: {block_reason}"
+        return None, "Gemini returned no candidates"
+
+    first = candidates[0]
+    parts = first.get("content", {}).get("parts") or []
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]
+    combined = "\n".join(texts).strip()
+    if not combined:
+        finish_reason = first.get("finishReason", "UNKNOWN")
+        return None, f"Gemini returned empty text (finishReason={finish_reason})"
+    return combined, None
+
+
 def _call_provider_raw(
     system_prompt: str,
     user_prompt: str,
     json_mode: bool = False,
     temperature: float = 0.2,
-    max_tokens: int = 900,
+    max_tokens: int = 1200,
     timeout: Optional[int] = None,
 ) -> LLMCallResult:
     settings = get_settings()
     provider, model, configured = _resolve_active_provider(settings)
     eff_timeout = timeout or settings.LLM_TIMEOUT_SECONDS
 
-    if not configured:
+    if not configured or provider != "gemini":
+        pref = (settings.LLM_PROVIDER or "gemini").strip().lower()
+        err = (
+            "OpenAI runtime is disabled; switch LLM_PROVIDER=gemini with GEMINI_API_KEY."
+            if pref == "openai"
+            else "Gemini API key not configured or LLM disabled"
+        )
         return LLMCallResult(
             ok=False,
             provider="grounded_deterministic",
             model="GovPath Grounded Synthesis Engine",
-            error="LLM provider not configured or disabled",
+            error=err,
         )
 
     started = time.perf_counter()
-    if provider == "openai":
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    # Gemini 2.5 models consume thinking tokens inside maxOutputTokens; bound thinkingBudget and raise output cap.
+    eff_max_tokens = max(max_tokens, 4096)
+    gen_cfg: dict[str, Any] = {
+        "temperature": temperature,
+        "maxOutputTokens": eff_max_tokens,
+    }
+    if "2.5" in model:
+        gen_cfg["thinkingConfig"] = {"thinkingBudget": 512 if json_mode else 1024}
+    if json_mode:
+        gen_cfg["responseMimeType"] = "application/json"
 
-        try:
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=eff_timeout,
-            )
-            latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
-            if not resp.ok:
-                err_msg = _redact_secrets(f"OpenAI HTTP {resp.status_code}: {resp.text[:220]}", settings)
-                logger.warning("LLM call failed provider=openai model=%s err=%s", model, err_msg)
-                return LLMCallResult(
-                    ok=False,
-                    provider="openai",
-                    model=model,
-                    error=err_msg,
-                    latency_ms=latency_ms,
-                )
-            body = resp.json()
-            content = body["choices"][0]["message"]["content"].strip()
-            usage = body.get("usage", {})
-            tokens = int(usage.get("total_tokens") or (_estimate_tokens(system_prompt + user_prompt + content)))
-            logger.info("LLM call ok provider=openai model=%s tokens=%s latency_ms=%s", model, tokens, latency_ms)
-            return LLMCallResult(
-                ok=True,
-                provider="openai",
-                model=model,
-                raw_text=content,
-                tokens_used=tokens,
-                latency_ms=latency_ms,
-            )
-        except requests.Timeout:
-            latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
-            err = f"OpenAI request timed out after {eff_timeout}s"
-            logger.warning("LLM timeout provider=openai model=%s", model)
-            return LLMCallResult(ok=False, provider="openai", model=model, error=err, latency_ms=latency_ms)
-        except Exception as exc:
-            latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
-            err = _redact_secrets(f"OpenAI request error: {exc}", settings)
-            logger.warning("LLM error provider=openai model=%s err=%s", model, err)
-            return LLMCallResult(ok=False, provider="openai", model=model, error=err, latency_ms=latency_ms)
+    payload: dict[str, Any] = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": gen_cfg,
+    }
 
-    if provider == "gemini":
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={settings.GEMINI_API_KEY}"
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "x-goog-api-key": settings.GEMINI_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=eff_timeout,
         )
-        gen_cfg: dict[str, Any] = {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-        }
-        if json_mode:
-            gen_cfg["responseMimeType"] = "application/json"
-
-        try:
-            resp = requests.post(
-                url,
-                json={
-                    "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
-                    "generationConfig": gen_cfg,
-                },
-                timeout=eff_timeout,
-            )
-            latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
-            if not resp.ok:
-                err_msg = _redact_secrets(f"Gemini HTTP {resp.status_code}: {resp.text[:220]}", settings)
-                logger.warning("LLM call failed provider=gemini model=%s err=%s", model, err_msg)
-                return LLMCallResult(
-                    ok=False,
-                    provider="gemini",
-                    model=model,
-                    error=err_msg,
-                    latency_ms=latency_ms,
-                )
-            body = resp.json()
-            content = body["candidates"][0]["content"]["parts"][0]["text"].strip()
-            tokens = _estimate_tokens(system_prompt + user_prompt + content)
-            logger.info("LLM call ok provider=gemini model=%s tokens=%s latency_ms=%s", model, tokens, latency_ms)
+        latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        if not resp.ok:
+            err_msg = _redact_secrets(f"Gemini HTTP {resp.status_code}: {resp.text[:240]}", settings)
+            logger.warning("LLM call failed provider=gemini model=%s err=%s", model, err_msg)
             return LLMCallResult(
-                ok=True,
+                ok=False,
                 provider="gemini",
                 model=model,
-                raw_text=content,
+                error=err_msg,
+                latency_ms=latency_ms,
+            )
+
+        body = resp.json()
+        content, extract_err = _extract_gemini_text(body)
+        usage_meta = body.get("usageMetadata") or {}
+        tokens = int(
+            usage_meta.get("totalTokenCount")
+            or _estimate_tokens(system_prompt + user_prompt + (content or ""))
+        )
+        if extract_err or not content:
+            logger.warning("LLM empty/blocked provider=gemini model=%s err=%s", model, extract_err)
+            return LLMCallResult(
+                ok=False,
+                provider="gemini",
+                model=model,
+                error=extract_err or "Gemini returned empty response",
                 tokens_used=tokens,
                 latency_ms=latency_ms,
             )
-        except requests.Timeout:
-            latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
-            err = f"Gemini request timed out after {eff_timeout}s"
-            logger.warning("LLM timeout provider=gemini model=%s", model)
-            return LLMCallResult(ok=False, provider="gemini", model=model, error=err, latency_ms=latency_ms)
-        except Exception as exc:
-            latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
-            err = _redact_secrets(f"Gemini request error: {exc}", settings)
-            logger.warning("LLM error provider=gemini model=%s err=%s", model, err)
-            return LLMCallResult(ok=False, provider="gemini", model=model, error=err, latency_ms=latency_ms)
 
-    return LLMCallResult(
-        ok=False,
-        provider="grounded_deterministic",
-        model="GovPath Grounded Synthesis Engine",
-        error="No active LLM provider resolved",
-    )
+        logger.info("LLM call ok provider=gemini model=%s tokens=%s latency_ms=%s", model, tokens, latency_ms)
+        return LLMCallResult(
+            ok=True,
+            provider="gemini",
+            model=model,
+            raw_text=content,
+            tokens_used=tokens,
+            latency_ms=latency_ms,
+        )
+    except requests.Timeout:
+        latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        err = f"Gemini request timed out after {eff_timeout}s"
+        logger.warning("LLM timeout provider=gemini model=%s", model)
+        return LLMCallResult(ok=False, provider="gemini", model=model, error=err, latency_ms=latency_ms)
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        err = _redact_secrets(f"Gemini request error: {exc}", settings)
+        logger.warning("LLM error provider=gemini model=%s err=%s", model, err)
+        return LLMCallResult(ok=False, provider="gemini", model=model, error=err, latency_ms=latency_ms)
 
 
 def generate_structured_json(
@@ -234,12 +225,11 @@ def generate_structured_json(
     user_prompt: str,
     schema_model: Optional[Type[T]] = None,
     temperature: float = 0.1,
-    max_tokens: int = 1000,
+    max_tokens: int = 1600,
     timeout: Optional[int] = None,
 ) -> LLMCallResult:
     """
-    Call the configured server-side LLM in JSON mode, parse the response,
-    and validate against a Pydantic model when provided.
+    Call Gemini in JSON mode, parse the response, and validate against a Pydantic model when provided.
     """
     res = _call_provider_raw(
         system_prompt=system_prompt,
@@ -292,7 +282,7 @@ def generate_llm_response_detailed(
     system_prompt: str,
     user_prompt: str,
     temperature: float = 0.25,
-    max_tokens: int = 900,
+    max_tokens: int = 1600,
     timeout: Optional[int] = None,
 ) -> LLMCallResult:
     return _call_provider_raw(

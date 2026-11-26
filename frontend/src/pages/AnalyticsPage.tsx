@@ -66,7 +66,10 @@ export default function AnalyticsPage() {
               <option value="TNPSC_GRP1">TNPSC Group I</option>
               <option value="TNPSC_GRP2">TNPSC Group II/IIA</option>
               <option value="SSC_CGL">SSC CGL</option>
+              <option value="SSC_CHSL">SSC CHSL</option>
               <option value="IBPS_PO">IBPS PO</option>
+              <option value="RRB_NTPC">RRB NTPC</option>
+              <option value="UPSC_CDS">UPSC CDS</option>
             </select>
             <select
               value={subjectId}

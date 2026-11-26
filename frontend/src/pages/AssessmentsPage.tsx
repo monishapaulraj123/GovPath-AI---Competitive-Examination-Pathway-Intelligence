@@ -24,6 +24,7 @@ const EXAM_LIST = [
 export default function AssessmentsPage({ mockMode = false }: { mockMode?: boolean }) {
   const [attempts, setAttempts] = useState<any[]>([]);
   const [subjects, setSubjects] = useState<any[]>([]);
+  const [competencies, setCompetencies] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -31,6 +32,7 @@ export default function AssessmentsPage({ mockMode = false }: { mockMode?: boole
   const [examId, setExamId] = useState('UPSC_CSE');
   const [assessmentType, setAssessmentType] = useState(mockMode ? 'mock_test' : 'diagnostic');
   const [subjectId, setSubjectId] = useState('');
+  const [competencyId, setCompetencyId] = useState('');
   const [questionCount, setQuestionCount] = useState(mockMode ? 15 : 8);
 
   // Active test runner state
@@ -53,9 +55,16 @@ export default function AssessmentsPage({ mockMode = false }: { mockMode?: boole
     setLoading(true);
     setError('');
     try {
-      const res = await api.listAssessments();
+      const [res, prof] = await Promise.all([
+        api.listAssessments(),
+        api.getProfile().catch(() => null),
+      ]);
       setAttempts(res.attempts || []);
       setSubjects(res.subjects || []);
+      setCompetencies(res.competencies || []);
+      if (prof?.primary_target_exam) {
+        setExamId(prof.primary_target_exam);
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to load assessments');
     } finally {
@@ -95,6 +104,7 @@ export default function AssessmentsPage({ mockMode = false }: { mockMode?: boole
         exam_id: examId,
         assessment_type: assessmentType,
         subject_id: subjectId || undefined,
+        competency_id: competencyId || undefined,
         question_count: questionCount,
       });
       setActiveTest(res);
@@ -159,6 +169,9 @@ export default function AssessmentsPage({ mockMode = false }: { mockMode?: boole
             <p className="text-xs text-gp-ink-secondary">
               Question {currentIdx + 1} of {activeTest.questions.length} · {q.source_type}
             </p>
+            {activeTest.selection_note && (
+              <p className="text-[11px] text-gp-primary mt-0.5">{activeTest.selection_note}</p>
+            )}
           </div>
           <div className="flex items-center gap-3">
             <div className="px-3 py-1.5 rounded-lg bg-gp-primary-light border border-gp-primary-border text-gp-primary font-mono text-sm font-bold flex items-center gap-1.5">
@@ -323,7 +336,7 @@ export default function AssessmentsPage({ mockMode = false }: { mockMode?: boole
         <h2 className="text-base font-bold text-gp-ink mb-4">
           {mockMode ? 'Configure Simulated Mock Test' : 'Launch New Assessment'}
         </h2>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3 items-end">
           <div>
             <label className="block text-xs font-semibold text-gp-ink-secondary mb-1">Target Exam</label>
             <select
@@ -356,7 +369,16 @@ export default function AssessmentsPage({ mockMode = false }: { mockMode?: boole
             <label className="block text-xs font-semibold text-gp-ink-secondary mb-1">Subject Focus (Optional)</label>
             <select
               value={subjectId}
-              onChange={(e) => setSubjectId(e.target.value)}
+              onChange={(e) => {
+                const nextSubj = e.target.value;
+                setSubjectId(nextSubj);
+                if (nextSubj && competencyId) {
+                  const matched = competencies.find((c) => c.id === competencyId);
+                  if (matched && matched.subject_id !== nextSubj) {
+                    setCompetencyId('');
+                  }
+                }
+              }}
               className="gov-input w-full px-3 py-2 text-xs font-medium"
             >
               <option value="">All Mapped Subjects</option>
@@ -368,12 +390,39 @@ export default function AssessmentsPage({ mockMode = false }: { mockMode?: boole
             </select>
           </div>
           <div>
+            <label className="block text-xs font-semibold text-gp-ink-secondary mb-1">Topic Focus (Optional)</label>
+            <select
+              value={competencyId}
+              onChange={(e) => {
+                const nextCid = e.target.value;
+                setCompetencyId(nextCid);
+                if (nextCid) {
+                  const matched = competencies.find((c) => c.id === nextCid);
+                  if (matched && matched.subject_id !== subjectId) {
+                    setSubjectId(matched.subject_id);
+                  }
+                }
+              }}
+              className="gov-input w-full px-3 py-2 text-xs font-medium"
+            >
+              <option value="">All Topics in Scope</option>
+              {competencies
+                .filter((c) => !subjectId || c.subject_id === subjectId)
+                .map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+            </select>
+          </div>
+          <div>
             <label className="block text-xs font-semibold text-gp-ink-secondary mb-1">Questions</label>
             <select
               value={questionCount}
               onChange={(e) => setQuestionCount(Number(e.target.value))}
               className="gov-input w-full px-3 py-2 text-xs font-medium"
             >
+              <option value={3}>3 Questions (~4 mins)</option>
               <option value={5}>5 Questions (~6 mins)</option>
               <option value={8}>8 Questions (~10 mins)</option>
               <option value={12}>12 Questions (~15 mins)</option>

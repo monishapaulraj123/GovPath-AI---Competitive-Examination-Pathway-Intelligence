@@ -31,6 +31,7 @@ from app.models import (
     CompetencyEvidence,
     Exam,
     ExamCompetencyRequirement,
+    Question,
     StudentProfile,
     StudyPlan,
     StudyTask,
@@ -151,6 +152,8 @@ class ValidateConstraintsArgs(BaseModel):
 class ValidateProposedActionArgs(BaseModel):
     proposal_type: str = Field(..., min_length=2, max_length=80)
     payload: dict[str, Any] = Field(default_factory=dict)
+    plan_activation_allowed: bool = Field(default=True)
+    modification_allowed: bool = Field(default=True)
 
 
 # ---------------------------------------------------------------------------
@@ -162,13 +165,14 @@ def _tool_get_aspirant_profile(db: Session, user_id: int, args: EmptyToolArgs) -
     if not profile:
         return {
             "exists": False,
+            "is_default_assumption": True,
             "user_id": user_id,
             "display_name": "Aspirant",
-            "primary_target_exam": "UPSC_CSE",
+            "primary_target_exam": None,
             "secondary_target_exams": [],
-            "daily_study_hours": 4.5,
-            "days_per_week": 6,
-            "timeline_months": 12,
+            "daily_study_hours": None,
+            "days_per_week": None,
+            "timeline_months": None,
             "occupation": "",
             "state": "",
         }
@@ -192,19 +196,33 @@ def _tool_get_aspirant_profile(db: Session, user_id: int, args: EmptyToolArgs) -
 
 def _tool_get_preparation_constraints(db: Session, user_id: int, args: EmptyToolArgs) -> dict[str, Any]:
     profile = db.query(StudentProfile).filter(StudentProfile.user_id == user_id).first()
-    daily_hours = profile.daily_study_hours if profile else 4.5
-    days_per_week = profile.days_per_week if profile else 6
-    timeline_months = profile.timeline_months if profile else 12
+    if not profile:
+        return {
+            "profile_exists": False,
+            "is_default_assumption": True,
+            "daily_study_hours": 4.5,
+            "days_per_week": 6,
+            "timeline_months": 12,
+            "weekly_hours": 27.0,
+            "total_horizon_hours": 1402.9,
+            "constraints_note": "No stored student profile found; simulation uses fallback defaults (4.5h/day, 6d/wk, 12m).",
+            "occupation": "",
+        }
+    daily_hours = profile.daily_study_hours
+    days_per_week = profile.days_per_week
+    timeline_months = profile.timeline_months
     weekly_hours = round(daily_hours * days_per_week, 1)
     total_horizon_hours = round(weekly_hours * 4.33 * timeline_months, 1)
     return {
+        "profile_exists": True,
+        "is_default_assumption": False,
         "daily_study_hours": daily_hours,
         "days_per_week": days_per_week,
         "timeline_months": timeline_months,
         "weekly_hours": weekly_hours,
         "total_horizon_hours": total_horizon_hours,
-        "constraints_note": profile.constraints if profile else "",
-        "occupation": profile.current_occupation if profile else "",
+        "constraints_note": profile.constraints or "",
+        "occupation": profile.current_occupation or "",
     }
 
 
@@ -230,19 +248,268 @@ def _tool_get_student_readiness(db: Session, user_id: int, args: ExamOptionalArg
 
 def _tool_get_competency_evidence(db: Session, user_id: int, args: ExamOptionalArgs) -> dict[str, Any]:
     exam_id = _resolve_exam_id(db, user_id, args.exam_id)
+    readiness = compute_readiness_profile(db, user_id, exam_id)
     gaps = compute_gap_analysis(db, user_id, exam_id)
     ev_count = db.query(CompetencyEvidence).filter(CompetencyEvidence.user_id == user_id).count()
+    assessed_comps = [
+        {
+            "competency_id": g["competency_id"],
+            "competency_name": g["competency_name"],
+            "subject_name": g["subject_name"],
+            "topic_name": g["topic_name"],
+            "current_evidence": g["current_evidence"],
+            "required_level": g["required_level"],
+            "evidence_count": g["evidence_count"],
+            "priority": g["priority"],
+        }
+        for g in gaps["competency_gaps"]
+        if g["evidence_count"] > 0
+    ]
+    unassessed_comps = [
+        {
+            "competency_id": g["competency_id"],
+            "competency_name": g["competency_name"],
+            "subject_name": g["subject_name"],
+            "topic_name": g["topic_name"],
+            "required_level": g["required_level"],
+            "weightage_percent": g["weightage_percent"],
+            "evidence_count": 0,
+        }
+        for g in gaps["competency_gaps"]
+        if g["evidence_count"] == 0
+    ]
     return {
         "exam_id": exam_id,
         "overall_weighted_gap": gaps["overall_weighted_gap"],
         "readiness_index": gaps["readiness_index"],
+        "assessments_completed": readiness["assessments_completed"],
+        "has_verified_assessment_evidence": readiness["assessments_completed"] > 0,
         "total_evidence_records": ev_count,
         "has_only_demo_data": gaps["has_only_demo_data"],
         "priority_counts": gaps["priority_counts"],
         "subject_gaps": gaps["subject_gaps"],
         "top_priorities": gaps["top_priorities"],
-        "missing_competencies_count": len(gaps["missing_competencies"]),
-        "missing_competencies": gaps["missing_competencies"][:6],
+        "assessed_competencies_count": len(assessed_comps),
+        "assessed_competencies": assessed_comps,
+        "missing_competencies_count": len(unassessed_comps),
+        "missing_competencies": unassessed_comps,
+    }
+
+
+def _tool_recommend_next_assessment(db: Session, user_id: int, args: ExamOptionalArgs) -> dict[str, Any]:
+    exam_id = _resolve_exam_id(db, user_id, args.exam_id)
+    readiness = compute_readiness_profile(db, user_id, exam_id)
+    gaps = compute_gap_analysis(db, user_id, exam_id)
+    retention = compute_retention_tracker(db, user_id, exam_id)
+    diagnosis = compute_performance_diagnosis(db, user_id)
+
+    all_qs = db.query(Question).all()
+    exam_qs = [q for q in all_qs if exam_id in (q.exam_mappings or [])] or all_qs
+    qs_by_comp: dict[str, int] = {}
+    qs_by_subj: dict[str, int] = {}
+    for q in exam_qs:
+        qs_by_comp[q.competency_id] = qs_by_comp.get(q.competency_id, 0) + 1
+        qs_by_subj[q.subject_id] = qs_by_subj.get(q.subject_id, 0) + 1
+
+    assessments_completed = int(readiness["assessments_completed"])
+    missing = gaps.get("missing_competencies", [])
+    overdue = [r for r in retention.get("items", []) if r["revision_status"] == "Revision Overdue"]
+    due_soon = [r for r in retention.get("items", []) if r["revision_status"] == "Due Soon"]
+    repeated_weak = diagnosis.get("repeated_weak_competencies", [])
+    total_mistakes = int(diagnosis.get("total_mistakes", 0))
+
+    if assessments_completed == 0:
+        avail = len(exam_qs)
+        rec_cnt = min(10, avail)
+        return {
+            "exam_id": exam_id,
+            "recommended_assessment_type": "diagnostic",
+            "title": f"{exam_id} Baseline Diagnostic Assessment",
+            "target_subject_id": None,
+            "target_competency_id": None,
+            "available_questions": avail,
+            "recommended_question_count": rec_cnt,
+            "estimated_minutes": rec_cnt,
+            "basis": "Zero completed assessments recorded for this account.",
+            "rationale": (
+                f"Because no completed assessment evidence exists yet, a {rec_cnt}-question baseline Diagnostic Assessment "
+                f"across {exam_id} will establish verified scores across core subjects instead of relying on unassessed defaults."
+            ),
+            "candidate_alternatives": [],
+        }
+
+    candidates: list[dict[str, Any]] = []
+
+    # Candidate 1: Overdue Retention Retrieval (if overdue items exist)
+    if overdue:
+        overdue_cids = {r["competency_id"] for r in overdue}
+        overdue_q_pool = sum(qs_by_comp.get(cid, 0) for cid in overdue_cids)
+        top_rev = overdue[0]
+        top_rev_qs = qs_by_comp.get(top_rev["competency_id"], 0)
+        # Revision mode in /assessments/start pulls across missed/overdue competencies in exam_qs
+        eff_avail = overdue_q_pool if overdue_q_pool >= 3 else len(exam_qs)
+        rec_cnt = min(6, max(1, min(eff_avail, max(3, overdue_q_pool))))
+        # Score weighs urgency, count of overdue topics, and sufficient question pool
+        score = round(
+            top_rev["urgency_score"] * 0.55
+            + min(30.0, len(overdue) * 5.0)
+            + (12.0 if overdue_q_pool >= 3 else 4.0),
+            1,
+        )
+        candidates.append({
+            "priority_score": score,
+            "recommended_assessment_type": "revision",
+            "title": f"Spaced Retrieval Revision Quiz ({len(overdue)} Overdue Topics, led by {top_rev['topic_name']})",
+            "target_subject_id": None,
+            "target_competency_id": top_rev["competency_id"],
+            "available_questions": eff_avail,
+            "topic_specific_questions": top_rev_qs,
+            "recommended_question_count": min(rec_cnt, eff_avail),
+            "estimated_minutes": min(rec_cnt, eff_avail),
+            "basis": (
+                f"{len(overdue)} overdue retention item(s) and {len(due_soon)} due soon; "
+                f"{top_rev['topic_name']} has urgency {top_rev['urgency_score']} "
+                f"({top_rev['retention_trend']}, score {top_rev['current_estimate']}%)."
+            ),
+            "rationale": (
+                f"Consolidates {len(overdue)} overdue competencies (starting with {top_rev['topic_name']}) "
+                f"using {min(rec_cnt, eff_avail)} targeted questions from {eff_avail} matching retrieval items."
+            ),
+        })
+
+    # Candidate 2: Repeated-Error Remediation (if repeated weak competencies exist)
+    if repeated_weak:
+        top_rep = repeated_weak[0]
+        rep_cid = top_rep["competency_id"]
+        rep_sid = top_rep.get("subject_id")
+        rep_comp_qs = qs_by_comp.get(rep_cid, 0)
+        rep_subj_qs = qs_by_subj.get(rep_sid, 0) if rep_sid else 0
+        # Prefer subject_test if single-competency bank has < 3 questions
+        use_subject = rep_comp_qs < 3 and rep_subj_qs >= 3
+        avail = rep_subj_qs if use_subject else rep_comp_qs
+        if avail >= 1:
+            rec_cnt = min(5, avail)
+            score = round(
+                min(45.0, top_rep["error_count"] * 12.0)
+                + (15.0 if top_rep.get("is_repeated_pattern") else 5.0)
+                + min(20.0, total_mistakes * 0.6)
+                + (10.0 if avail >= 3 else 2.0),
+                1,
+            )
+            candidates.append({
+                "priority_score": score,
+                "recommended_assessment_type": "subject_test" if use_subject else "topic_quiz",
+                "title": (
+                    f"Targeted Remediation Subject Test: {rep_sid} (focus: {top_rep['topic_name']})"
+                    if use_subject
+                    else f"Targeted Error-Remediation Quiz: {top_rep['topic_name']}"
+                ),
+                "target_subject_id": rep_sid if use_subject else None,
+                "target_competency_id": None if use_subject else rep_cid,
+                "available_questions": avail,
+                "topic_specific_questions": rep_comp_qs,
+                "recommended_question_count": rec_cnt,
+                "estimated_minutes": rec_cnt,
+                "basis": (
+                    f"{total_mistakes} total recorded mistakes; {top_rep['topic_name']} has "
+                    f"{top_rep['error_count']} error(s) (repeated={top_rep.get('is_repeated_pattern')})."
+                ),
+                "rationale": (
+                    f"Directly targets repeated mistakes in {top_rep['topic_name']} "
+                    f"({rec_cnt} questions from {avail} available matching questions)."
+                ),
+            })
+
+    # Candidate 3: Unassessed Competency Coverage (missing evidence)
+    for m in missing:
+        comp_qs = qs_by_comp.get(m["competency_id"], 0)
+        subj_qs = qs_by_subj.get(m["subject_id"], 0)
+        if comp_qs == 0 and subj_qs == 0:
+            continue
+        # Never claim more topic questions than exist; switch to subject_test if topic has <3 questions and subject has >=3
+        use_subject = comp_qs < 3 and subj_qs >= 3
+        avail = subj_qs if use_subject else comp_qs
+        rec_cnt = min(5, avail)
+        score = round(
+            m["weightage_percent"] * 5.0
+            + 20.0  # missing-evidence bonus
+            + (10.0 if comp_qs >= 3 else (5.0 if use_subject else -10.0)),
+            1,
+        )
+        candidates.append({
+            "priority_score": score,
+            "recommended_assessment_type": "subject_test" if use_subject else "topic_quiz",
+            "title": (
+                f"Subject Coverage Test: {m['subject_name']} (includes unassessed {m['topic_name']})"
+                if use_subject
+                else f"Topic Quiz: {m['topic_name']} ({m['subject_name']})"
+            ),
+            "target_subject_id": m["subject_id"],
+            "target_competency_id": None if use_subject else m["competency_id"],
+            "available_questions": avail,
+            "topic_specific_questions": comp_qs,
+            "recommended_question_count": rec_cnt,
+            "estimated_minutes": rec_cnt,
+            "basis": (
+                f"Unassessed competency ({m['weightage_percent']}% exam weightage, 0 evidence records; "
+                f"{comp_qs} topic-specific / {subj_qs} subject questions available)."
+            ),
+            "rationale": (
+                f"Closes the unassessed blind spot in {m['topic_name']} ({m['weightage_percent']}% weightage) "
+                + (
+                    f"via a {rec_cnt}-question {m['subject_name']} subject test ({subj_qs} available) because only {comp_qs} topic-specific question exists."
+                    if use_subject
+                    else f"using {rec_cnt} of {avail} available questions."
+                )
+            ),
+        })
+        break  # evaluate top unassessed candidate against retention & error candidates
+
+    if not candidates:
+        avail = len(exam_qs)
+        rec_cnt = min(6, avail)
+        return {
+            "exam_id": exam_id,
+            "recommended_assessment_type": "mock_test",
+            "title": f"{exam_id} Comprehensive Practice Check",
+            "target_subject_id": None,
+            "target_competency_id": None,
+            "available_questions": avail,
+            "recommended_question_count": rec_cnt,
+            "estimated_minutes": rec_cnt,
+            "basis": "Fallback comprehensive benchmark across available exam questions.",
+            "rationale": f"Evaluates pacing and accuracy across {rec_cnt} of {avail} available exam questions.",
+            "candidate_alternatives": [],
+        }
+
+    candidates.sort(key=lambda c: -c["priority_score"])
+    best = candidates[0]
+    alternatives = [
+        {
+            "title": c["title"],
+            "recommended_assessment_type": c["recommended_assessment_type"],
+            "priority_score": c["priority_score"],
+            "recommended_question_count": c["recommended_question_count"],
+            "available_questions": c["available_questions"],
+            "basis": c["basis"],
+        }
+        for c in candidates[1:3]
+    ]
+
+    return {
+        "exam_id": exam_id,
+        "recommended_assessment_type": best["recommended_assessment_type"],
+        "title": best["title"],
+        "target_subject_id": best["target_subject_id"],
+        "target_competency_id": best["target_competency_id"],
+        "available_questions": best["available_questions"],
+        "topic_specific_questions": best.get("topic_specific_questions", best["available_questions"]),
+        "recommended_question_count": best["recommended_question_count"],
+        "estimated_minutes": best["estimated_minutes"],
+        "priority_score": best["priority_score"],
+        "basis": best["basis"],
+        "rationale": best["rationale"],
+        "candidate_alternatives": alternatives,
     }
 
 
@@ -257,6 +524,7 @@ def _tool_get_retention_status(db: Session, user_id: int, args: ExamOptionalArgs
         "methodology_note": ret["methodology_note"],
         "overdue_and_due_soon": overdue[:8],
         "declining_items": declining[:5],
+        "items": ret["items"],
     }
 
 
@@ -466,6 +734,11 @@ def _tool_calculate_transferability(db: Session, user_id: int, args: TransferArg
         c for c in transfer["competencies"]
         if c["classification"] in ("Not Covered", "Requires Reinforcement")
     ]
+    target_only = [c for c in transfer["competencies"] if c["classification"] == "Not Covered"]
+    assessed_shared = [
+        c for c in transfer["competencies"]
+        if c["classification"] != "Not Covered" and c.get("evidence_count", 0) > 0
+    ]
     return {
         "source_exam_id": transfer["source_exam_id"],
         "source_exam_name": transfer["source_exam_name"],
@@ -475,11 +748,20 @@ def _tool_calculate_transferability(db: Session, user_id: int, args: TransferArg
         "shared_competency_count": len(overlap["shared"]),
         "target_only_competency_count": len(overlap["target_only"]),
         "effective_transfer_index": transfer["effective_transfer_index"],
+        "verified_mastery_transfer_percent": transfer["verified_mastery_transfer_percent"],
+        "assessments_completed": transfer["assessments_completed"],
+        "evidence_backed_shared_count": transfer["evidence_backed_shared_count"],
+        "unassessed_shared_count": transfer["unassessed_shared_count"],
+        "evidence_basis": transfer["evidence_basis"],
+        "transfer_index_label": transfer["transfer_index_label"],
+        "transfer_index_disclosure": transfer["transfer_index_disclosure"],
         "classification_counts": transfer["classification_counts"],
         "estimated_additional_hours": transfer["estimated_additional_hours"],
         "effort_model_note": transfer["effort_model_note"],
         "top_missing_or_reinforce": bridge[:6],
-        "shared_competencies_sample": overlap["shared"][:6],
+        "target_only_competencies_sample": target_only[:6],
+        "assessed_shared_competencies": assessed_shared[:6],
+        "shared_competencies_sample": overlap["shared"][:8],
     }
 
 
@@ -582,6 +864,8 @@ def _tool_validate_constraints(db: Session, user_id: int, args: ValidateConstrai
 def _tool_validate_proposed_action(db: Session, user_id: int, args: ValidateProposedActionArgs) -> dict[str, Any]:
     valid_ids = _valid_exam_ids(db)
     if args.proposal_type == "apply_study_plan":
+        if not args.plan_activation_allowed:
+            return {"valid": False, "reason": "Plan activation/proposal is prohibited by workflow constraints."}
         exam_id = args.payload.get("exam_id")
         daily_hours = args.payload.get("daily_hours")
         if exam_id not in valid_ids:
@@ -590,6 +874,8 @@ def _tool_validate_proposed_action(db: Session, user_id: int, args: ValidateProp
             return {"valid": False, "reason": "daily_hours out of valid range [0.5, 16.0]"}
         return {"valid": True, "reason": "Validated study plan proposal"}
     if args.proposal_type == "update_target_exam":
+        if not args.modification_allowed:
+            return {"valid": False, "reason": "Record modification is prohibited by workflow constraints."}
         exam_id = args.payload.get("exam_id")
         if exam_id not in valid_ids:
             return {"valid": False, "reason": f"Invalid exam_id '{exam_id}'"}
@@ -712,6 +998,27 @@ class ToolRegistry:
                 state.tool_execution_records.append(rec)
                 state.errors.append(err)
             return ToolExecutionResult(ok=False, tool_name=tool_name, error=err, trace_record=rec)
+
+        # Security: workflow action constraint enforcement at tool execution level
+        if state is not None and tool_name == "generate_study_plan_preview":
+            ac = state.action_constraints
+            if ac.investigation_only or not ac.plan_generation_allowed or not ac.plan_preview_allowed:
+                err = "Blocked by workflow action constraint: study plan generation/preview is prohibited."
+                rec = ToolExecutionRecord(
+                    execution_id=execution_id,
+                    step_order=step_order,
+                    kind="tool",
+                    agent=agent_name,
+                    tool=tool_name,
+                    status="skipped",
+                    input_summary=json.dumps(args_dict, default=str)[:160],
+                    started_at=started_iso,
+                    ended_at=_utc_iso(),
+                    duration_ms=0.0,
+                    skip_reason=err,
+                )
+                state.tool_execution_records.append(rec)
+                return ToolExecutionResult(ok=False, tool_name=tool_name, error=err, skipped=True, trace_record=rec)
 
         # Bound: max tool calls
         if state is not None and state.tool_calls_used >= settings.ORCHESTRATOR_MAX_TOOL_CALLS:
@@ -913,6 +1220,13 @@ class ToolRegistry:
                 category="student_analysis",
                 input_model=EmptyToolArgs,
                 handler=_tool_get_preparation_progress,
+            ),
+            ToolDefinition(
+                name="recommend_next_assessment",
+                description="Recommend the most useful next assessment (diagnostic, topic quiz, or revision) from evidence gaps.",
+                category="student_analysis",
+                input_model=ExamOptionalArgs,
+                handler=_tool_recommend_next_assessment,
             ),
             # Exam Intelligence Tools
             ToolDefinition(

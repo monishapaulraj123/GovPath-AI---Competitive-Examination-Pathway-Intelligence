@@ -74,21 +74,36 @@ export default function StudyPlanPage() {
   };
 
   const handleTaskStatus = async (taskId: number, status: string) => {
-    const updated = await api.updateStudyTask(taskId, { status });
-    setPlan(updated);
+    setError('');
+    try {
+      const updated = await api.updateStudyTask(taskId, { status });
+      setPlan(updated);
+    } catch (err: any) {
+      setError(err.message || 'Failed to update task status');
+    }
   };
 
   const handleDeleteTask = async (taskId: number) => {
-    const updated = await api.deleteStudyTask(taskId);
-    setPlan(updated);
+    setError('');
+    try {
+      const updated = await api.deleteStudyTask(taskId);
+      setPlan(updated);
+    } catch (err: any) {
+      setError(err.message || 'Failed to delete task');
+    }
   };
 
   const handleAddTask = async (e: React.FormEvent) => {
     e.preventDefault();
-    const updated = await api.addStudyTask(newTask);
-    setPlan(updated);
-    setShowAdd(false);
-    setNewTask({ ...newTask, title: '', notes: '' });
+    setError('');
+    try {
+      const updated = await api.addStudyTask(newTask);
+      setPlan(updated);
+      setShowAdd(false);
+      setNewTask({ ...newTask, title: '', notes: '' });
+    } catch (err: any) {
+      setError(err.message || 'Failed to add custom study task');
+    }
   };
 
   if (loading) return <LoadingState label="Loading Adaptive Study Planner..." />;

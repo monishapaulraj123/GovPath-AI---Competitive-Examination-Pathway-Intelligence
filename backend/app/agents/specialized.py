@@ -1,21 +1,14 @@
 """
 Six Specialized Tool-Grounded GovPath AI Agents.
-Each agent executes approved tools from ToolRegistry backed by the real computational engines
-and returns a validated structured output.
+Each agent executes approved tools from ToolRegistry backed by the real computational engines,
+enforces WorkflowActionConstraints, and returns a validated structured output.
 """
 
-from datetime import datetime, timezone
-import time
 from typing import Any, Optional
-import uuid
 from sqlalchemy.orm import Session
 
-from app.agents.schemas import AgentOutput, OrchestrationState, ToolExecutionRecord
+from app.agents.schemas import AgentOutput, OrchestrationState
 from app.agents.tool_registry import ToolRegistry, get_tool_registry
-
-
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _run_tool(
@@ -76,26 +69,60 @@ class StudentAnalysisAgent:
 
         readiness = _run_tool(reg, db, user_id, "get_student_readiness", {"exam_id": eff_exam_id}, state, self.name, cache, tools_used, evidence_refs, limitations) or {}
         gaps = _run_tool(reg, db, user_id, "get_competency_evidence", {"exam_id": eff_exam_id}, state, self.name, cache, tools_used, evidence_refs, limitations) or {}
-        retention = _run_tool(reg, db, user_id, "get_retention_status", {"exam_id": eff_exam_id}, state, self.name, cache, tools_used, evidence_refs, limitations) or {}
 
-        progress = None
+        retention: dict[str, Any] = {}
+        if not requested_tools or "get_retention_status" in requested_tools:
+            retention = _run_tool(reg, db, user_id, "get_retention_status", {"exam_id": eff_exam_id}, state, self.name, cache, tools_used, evidence_refs, limitations) or {}
+
+        progress: dict[str, Any] = {}
         if not requested_tools or "get_preparation_progress" in requested_tools:
-            progress = _run_tool(reg, db, user_id, "get_preparation_progress", {}, state, self.name, cache, tools_used, evidence_refs, limitations)
+            progress = _run_tool(reg, db, user_id, "get_preparation_progress", {}, state, self.name, cache, tools_used, evidence_refs, limitations) or {}
 
-        if readiness.get("assessments_completed", 0) == 0:
-            missing_evidence.append("No completed assessments recorded yet; readiness and gap estimates lack empirical quiz evidence.")
+        existing_plan_tasks: dict[str, Any] = {}
+        if requested_tools and "get_existing_study_tasks" in requested_tools:
+            existing_plan_tasks = _run_tool(
+                reg, db, user_id, "get_existing_study_tasks", {}, state, self.name, cache, tools_used, evidence_refs, limitations
+            ) or {}
+
+        if profile.get("is_default_assumption") or constraints.get("is_default_assumption"):
+            limitations.append(
+                "No stored student profile record was found; study capacity figures reflect fallback defaults until profile constraints are saved."
+            )
+
+        next_assessment = None
+        should_recommend_assessment = (
+            (requested_tools and "recommend_next_assessment" in requested_tools)
+            or readiness.get("assessments_completed", 0) == 0
+        )
+        if should_recommend_assessment:
+            next_assessment = _run_tool(
+                reg, db, user_id, "recommend_next_assessment", {"exam_id": eff_exam_id},
+                state, self.name, cache, tools_used, evidence_refs, limitations,
+            )
+
+        assessments_completed = int(readiness.get("assessments_completed", 0))
+        if assessments_completed == 0:
+            missing_evidence.append(
+                "No completed assessments recorded yet; measured performance evidence is unavailable. "
+                "Unassessed competencies indicate missing measurement, not zero knowledge."
+            )
         if readiness.get("has_only_demo_data"):
             limitations.append("Current readiness metrics are derived from initial demonstration seed records.")
 
         overdue_revs = retention.get("overdue_and_due_soon", [])[:5]
         profile_summary = {
+            "user_id": profile.get("user_id", user_id),
+            "exists": profile.get("exists", False),
             "display_name": profile.get("display_name", "Aspirant"),
             "daily_hours": constraints.get("daily_study_hours", profile.get("daily_study_hours", 4.5)),
             "days_per_week": constraints.get("days_per_week", profile.get("days_per_week", 6)),
             "timeline_months": constraints.get("timeline_months", profile.get("timeline_months", 12)),
+            "weekly_hours": constraints.get("weekly_hours", 27.0),
+            "total_horizon_hours": constraints.get("total_horizon_hours", 1400.0),
             "primary_target_exam": profile.get("primary_target_exam", eff_exam_id),
             "occupation": profile.get("occupation", ""),
             "state": profile.get("state", ""),
+            "constraints_note": constraints.get("constraints_note", ""),
         }
 
         readiness_summary = {
@@ -105,9 +132,28 @@ class StudentAnalysisAgent:
             "accuracy": readiness.get("accuracy", 0.0),
             "retention_index": readiness.get("retention_index", 0.0),
             "consistency": readiness.get("consistency", 0.0),
-            "assessments_completed": readiness.get("assessments_completed", 0),
+            "assessments_completed": assessments_completed,
+            "evidence_points": readiness.get("evidence_points", 0),
             "has_only_demo_data": readiness.get("has_only_demo_data", False),
             "subject_breakdown": readiness.get("subject_breakdown", []),
+        }
+
+        evidence_classification = {
+            "has_verified_assessment_evidence": assessments_completed > 0,
+            "assessments_completed": assessments_completed,
+            "total_evidence_records": gaps.get("total_evidence_records", 0),
+            "assessed_competencies_count": gaps.get("assessed_competencies_count", 0),
+            "assessed_competencies": gaps.get("assessed_competencies", []),
+            "missing_competencies_count": gaps.get("missing_competencies_count", 0),
+            "missing_competencies": gaps.get("missing_competencies", []),
+            "stored_activity": {
+                "profile_exists": profile.get("exists", False),
+                "has_active_study_plan": progress.get("has_active_study_plan", False),
+                "active_plan_exam": progress.get("active_plan_exam"),
+                "total_tasks": progress.get("total_tasks", 0),
+                "completed_tasks": progress.get("completed_tasks", 0),
+                "recent_attempts": progress.get("recent_attempts", []),
+            },
         }
 
         data_payload = {
@@ -120,6 +166,9 @@ class StudentAnalysisAgent:
             "overdue_revisions": overdue_revs,
             "retention": retention,
             "progress": progress,
+            "existing_plan_tasks": existing_plan_tasks,
+            "evidence_classification": evidence_classification,
+            "next_assessment_recommendation": next_assessment,
         }
 
         structured = AgentOutput(
@@ -129,9 +178,10 @@ class StudentAnalysisAgent:
             tool_used=" + ".join(tools_used),
             tools_used=tools_used,
             summary=(
-                f"Readiness for {eff_exam_id}: {readiness_summary['readiness_index']}% "
-                f"(Coverage {readiness_summary['competency_coverage']}%, Accuracy {readiness_summary['accuracy']}%), "
-                f"weighted gap {data_payload['overall_weighted_gap']}, {len(overdue_revs)} urgent revision(s)."
+                f"{eff_exam_id}: assessments={assessments_completed}, "
+                f"assessed_competencies={evidence_classification['assessed_competencies_count']}, "
+                f"unassessed={evidence_classification['missing_competencies_count']}, "
+                f"readiness={readiness_summary['readiness_index']}%."
             ),
             data=data_payload,
             evidence_refs=evidence_refs,
@@ -139,7 +189,6 @@ class StudentAnalysisAgent:
             missing_evidence=missing_evidence,
         ).model_dump()
 
-        # Preserve top-level keys for backward compatibility
         structured.update(data_payload)
         return structured
 
@@ -180,6 +229,7 @@ class ExamIntelligenceAgent:
                 exam_summaries.append({
                     "exam_id": struct["exam_id"],
                     "name": struct["name"],
+                    "short_name": struct["short_name"],
                     "authority": struct["conducting_authority"],
                     "stages": [s["stage"] for s in (struct.get("stages") or [])],
                     "eligibility": struct["eligibility_summary"],
@@ -264,14 +314,38 @@ class PerformanceDiagnosisAgent:
         if diag.get("has_only_demo_data"):
             limitations.append("Diagnosis reflects demonstration seed attempts.")
 
+        # Consume shared StudentAnalysisAgent retention trends from orchestration state so an improving
+        # competency (with only 1 historical mistake) is not misclassified as weak.
+        sa_ret_items = []
+        if state is not None:
+            sa_ret_items = (
+                state.retrieved_evidence.get("StudentAnalysisAgent", {})
+                .get("retention", {})
+                .get("items", [])
+            )
+        improving_cids = {
+            item["competency_id"]
+            for item in sa_ret_items
+            if item.get("retention_trend") == "Improving" and float(item.get("current_estimate", 0.0)) >= 70.0
+        }
+        filtered_repeated_weak = [
+            w for w in diag.get("repeated_weak_competencies", [])
+            if w.get("is_repeated_pattern") or w.get("competency_id") not in improving_cids
+        ][:5]
+        filtered_top_gaps = [
+            g for g in weak.get("top_gap_competencies", [])
+            if g.get("competency_id") not in improving_cids
+        ][:5]
+
         data_payload = {
             "has_data": has_data,
             "total_attempts": diag.get("total_attempts", 0),
             "total_mistakes": diag.get("total_mistakes", 0),
             "error_breakdown": diag.get("error_category_breakdown", {}),
             "difficulty_performance": diag.get("difficulty_performance", {}),
-            "repeated_weak": diag.get("repeated_weak_competencies", [])[:5],
-            "top_gap_competencies": weak.get("top_gap_competencies", [])[:5],
+            "repeated_weak": filtered_repeated_weak,
+            "excluded_improving_competencies": sorted(improving_cids),
+            "top_gap_competencies": filtered_top_gaps,
             "recommendations": diag.get("recommendations", []),
         }
 
@@ -330,7 +404,7 @@ class KnowledgeTransferAgent:
         ) or {}
 
         comparison = None
-        if extra_exam_ids and len(extra_exam_ids) >= 2:
+        if extra_exam_ids and len(extra_exam_ids) > 2:
             comparison = _run_tool(
                 reg,
                 db,
@@ -347,6 +421,15 @@ class KnowledgeTransferAgent:
 
         if not transfer:
             missing_evidence.append(f"Unable to compute transferability between {source_exam_id} and {target_exam_id}.")
+        else:
+            disclosure = transfer.get("transfer_index_disclosure")
+            if disclosure and transfer.get("evidence_basis") != "evidence_backed":
+                limitations.append(disclosure)
+            if transfer.get("assessments_completed", 0) == 0:
+                missing_evidence.append(
+                    f"No completed assessment evidence exists for {source_exam_id} or {target_exam_id}; "
+                    "shared competencies reflect theoretical syllabus overlap, not verified individual proficiency."
+                )
 
         data_payload = {
             "source_exam_id": transfer.get("source_exam_id", source_exam_id),
@@ -354,10 +437,22 @@ class KnowledgeTransferAgent:
             "source_exam": transfer.get("source_exam_name", source_exam_id),
             "target_exam": transfer.get("target_exam_name", target_exam_id),
             "structural_overlap_percent": transfer.get("structural_overlap_percent", 0.0),
+            "shared_competency_count": transfer.get("shared_competency_count", 0),
+            "target_only_competency_count": transfer.get("target_only_competency_count", 0),
             "effective_transfer_index": transfer.get("effective_transfer_index", 0.0),
+            "verified_mastery_transfer_percent": transfer.get("verified_mastery_transfer_percent", 0.0),
+            "assessments_completed": transfer.get("assessments_completed", 0),
+            "evidence_backed_shared_count": transfer.get("evidence_backed_shared_count", 0),
+            "unassessed_shared_count": transfer.get("unassessed_shared_count", 0),
+            "evidence_basis": transfer.get("evidence_basis", "structural_baseline_only"),
+            "transfer_index_label": transfer.get("transfer_index_label", "Model-Estimated Potential Transfer Index"),
+            "transfer_index_disclosure": transfer.get("transfer_index_disclosure", ""),
             "classification_counts": transfer.get("classification_counts", {}),
             "estimated_additional_hours": transfer.get("estimated_additional_hours", 0.0),
-            "top_missing_or_reinforce": transfer.get("top_missing_or_reinforce", [])[:5],
+            "top_missing_or_reinforce": transfer.get("top_missing_or_reinforce", [])[:6],
+            "target_only_competencies_sample": transfer.get("target_only_competencies_sample", [])[:6],
+            "assessed_shared_competencies": transfer.get("assessed_shared_competencies", [])[:6],
+            "shared_competencies_sample": transfer.get("shared_competencies_sample", [])[:8],
             "effort_note": transfer.get("effort_model_note", ""),
             "multi_exam_comparison": comparison,
         }
@@ -370,9 +465,9 @@ class KnowledgeTransferAgent:
             tools_used=tools_used,
             summary=(
                 f"{data_payload['source_exam']} -> {data_payload['target_exam']}: "
-                f"overlap {data_payload['structural_overlap_percent']}%, "
-                f"transfer {data_payload['effective_transfer_index']}%, "
-                f"~{data_payload['estimated_additional_hours']} bridge hrs."
+                f"structural_overlap={data_payload['structural_overlap_percent']}%, "
+                f"model_transfer={data_payload['effective_transfer_index']}% ({data_payload['evidence_basis']}), "
+                f"verified_mastery_transfer={data_payload['verified_mastery_transfer_percent']}%."
                 if transfer else "Knowledge transfer computation failed."
             ),
             data=data_payload,
@@ -397,6 +492,7 @@ class PathwayPlanningAgent:
         days_per_week: Optional[int] = None,
         duration_months: Optional[int] = None,
         focus_subject_ids: Optional[list[str]] = None,
+        feasibility_only: bool = False,
         registry: Optional[ToolRegistry] = None,
         state: Optional[OrchestrationState] = None,
         cache: Optional[dict[str, dict[str, Any]]] = None,
@@ -407,10 +503,12 @@ class PathwayPlanningAgent:
         limitations: list[str] = []
         missing_evidence: list[str] = []
 
-        pathways = _run_tool(reg, db, user_id, "get_pathway_recommendations", {}, state, self.name, cache, tools_used, evidence_refs, limitations) or {}
+        pathways: dict[str, Any] = {}
+        if not feasibility_only:
+            pathways = _run_tool(reg, db, user_id, "get_pathway_recommendations", {}, state, self.name, cache, tools_used, evidence_refs, limitations) or {}
 
         sim = None
-        if switch_exam_id or hours is not None or duration_months is not None or days_per_week is not None:
+        if feasibility_only or switch_exam_id or hours is not None or duration_months is not None or days_per_week is not None:
             sim_args: dict[str, Any] = {}
             if switch_exam_id:
                 sim_args["target_exam_id"] = switch_exam_id
@@ -426,17 +524,36 @@ class PathwayPlanningAgent:
             sim = _run_tool(reg, db, user_id, "simulate_preparation_constraints", sim_args, state, self.name, cache, tools_used, evidence_refs, limitations)
 
         top_pathways = pathways.get("pathways", [])[:4]
+        feasibility_risks: list[str] = []
+        feasibility_assumptions: list[str] = []
+        if sim:
+            wa = sim.get("workload_assessment", {})
+            bc = sim.get("baseline_comparison", {})
+            ratio = wa.get("capacity_to_need_ratio", 0.0)
+            if wa.get("feasibility_status") == "Time-Constrained":
+                feasibility_risks.append(
+                    f"Available time ({wa.get('total_available_hours')}h) is below estimated gap-closure workload "
+                    f"({wa.get('estimated_required_hours')}h, capacity ratio {ratio})."
+                )
+            if bc.get("current_readiness_index", 0.0) == 0.0:
+                feasibility_risks.append(
+                    "Baseline readiness is 0.0% because no assessments are completed; actual required study hours may be lower if prior knowledge exists."
+                )
+            feasibility_assumptions.append(sim.get("disclaimer", ""))
+
         data_payload = {
-            "primary_exam_id": pathways.get("primary_exam_id"),
+            "primary_exam_id": pathways.get("primary_exam_id") or (sim["scenario"]["target_exam_id"] if sim else None),
             "student_constraints": pathways.get("student_constraints", {}),
             "top_pathways": top_pathways,
             "simulation": sim,
+            "feasibility_risks": feasibility_risks,
+            "feasibility_assumptions": feasibility_assumptions,
         }
 
         sim_note = ""
         if sim:
             wa = sim.get("workload_assessment", {})
-            sim_note = f" Simulation feasibility: {wa.get('feasibility_status')} (ratio {wa.get('capacity_to_need_ratio')})."
+            sim_note = f" Feasibility={wa.get('feasibility_status')} (ratio={wa.get('capacity_to_need_ratio')})."
 
         structured = AgentOutput(
             agent=self.name,
@@ -444,7 +561,10 @@ class PathwayPlanningAgent:
             status="completed",
             tool_used=" + ".join(tools_used),
             tools_used=tools_used,
-            summary=f"Evaluated {len(top_pathways)} pathway(s).{sim_note}",
+            summary=(
+                f"Evaluated feasibility for {sim['scenario']['target_exam_id']}.{sim_note}"
+                if feasibility_only and sim else f"Evaluated {len(top_pathways)} pathway(s).{sim_note}"
+            ),
             data=data_payload,
             evidence_refs=evidence_refs,
             limitations=limitations,
@@ -475,6 +595,22 @@ class StudyOptimizationAgent:
         evidence_refs: list[str] = []
         limitations: list[str] = []
         missing_evidence: list[str] = []
+
+        # Enforce workflow action constraints before executing any study-plan tools
+        if state is not None:
+            ac = state.action_constraints
+            if ac.investigation_only or not ac.plan_generation_allowed or not ac.plan_preview_allowed:
+                reason = "Blocked by workflow action constraints: study plan generation/preview is prohibited."
+                return AgentOutput(
+                    agent=self.name,
+                    agent_key=self.agent_key,
+                    status="skipped",
+                    tool_used="",
+                    tools_used=[],
+                    summary=reason,
+                    data={"preview_plan": {}, "existing_plan": {}, "blocked_reason": reason},
+                    limitations=[reason],
+                ).model_dump()
 
         existing = _run_tool(reg, db, user_id, "get_existing_study_tasks", {}, state, self.name, cache, tools_used, evidence_refs, limitations) or {}
         plan_args: dict[str, Any] = {"exam_id": exam_id}

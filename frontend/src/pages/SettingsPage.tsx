@@ -197,7 +197,7 @@ export default function SettingsPage() {
               <div className="font-semibold text-gp-ink mt-0.5">
                 {sysStatus.llm_status.configured
                   ? `${sysStatus.llm_status.provider} · ${sysStatus.llm_status.model}`
-                  : 'Grounded Deterministic Mode (Set OPENAI_API_KEY or GEMINI_API_KEY in backend/.env to enable external LLM)'}
+                  : 'Grounded Deterministic Mode (Set GEMINI_API_KEY in backend/.env to enable Gemini LLM)'}
               </div>
             </div>
           </div>
