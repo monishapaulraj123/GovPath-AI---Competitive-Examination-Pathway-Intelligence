@@ -136,8 +136,21 @@ export default function CounsellorPage() {
   };
 
   const handleApplyProposal = async (msgId: number, proposal: any) => {
-    await api.applyProposal(proposal.proposal_type, proposal.payload);
-    setAppliedMsgId(msgId);
+    try {
+      await api.applyProposal(proposal.proposal_type, proposal.payload);
+      setAppliedMsgId(msgId);
+    } catch (err: any) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now() + 2,
+          role: 'assistant',
+          content: `Failed to apply proposal: ${err.message || 'Request failed'}`,
+          citations: [],
+          agent_trace: [],
+        },
+      ]);
+    }
   };
 
   const handleIngestDoc = async (e: React.FormEvent) => {
@@ -331,60 +344,117 @@ export default function CounsellorPage() {
                       <MarkdownProse content={m.content} />
 
                       {/* Agent Execution Trace */}
-                      {m.agent_trace?.length > 0 && (
-                        <div className="pt-2 border-t border-gp-divider space-y-2">
-                          <div className="text-[10px] font-semibold uppercase tracking-wider text-gp-ink-muted">
-                            Agent Orchestrator Trace ({m.agent_trace.length} steps)
-                          </div>
-                          <div className="flex flex-wrap gap-1.5">
-                            {m.agent_trace
-                              .filter((tr: any) => !tr.kind || tr.kind !== 'tool')
-                              .map((tr: any, i: number) => {
-                                const isFailed = tr.status === 'failed';
-                                const isSkipped = tr.status === 'skipped';
-                                const badgeClass = isFailed
-                                  ? 'bg-red-50 border-red-200 text-red-700'
-                                  : isSkipped
-                                    ? 'bg-amber-50 border-amber-200 text-amber-700'
-                                    : 'bg-gp-primary-light border-gp-primary-border text-gp-primary';
-                                return (
-                                  <span
-                                    key={tr.execution_id || i}
-                                    title={tr.output_summary || tr.error_details || tr.skip_reason || tr.tool}
-                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] font-medium ${badgeClass}`}
-                                  >
-                                    <Sparkles className="w-3 h-3" />
-                                    {tr.agent}
-                                    {tr.duration_ms !== undefined && tr.duration_ms !== null && (
-                                      <span className="opacity-70 text-[10px]">({Math.round(tr.duration_ms)}ms)</span>
-                                    )}
-                                  </span>
-                                );
-                              })}
-                          </div>
-                          {m.agent_trace.some((tr: any) => tr.kind === 'tool') && (
-                            <details className="text-[11px] text-gp-ink-secondary">
-                              <summary className="cursor-pointer hover:text-gp-primary font-medium">
-                                View detailed tool execution trace ({m.agent_trace.filter((tr: any) => tr.kind === 'tool').length} tool calls)
-                              </summary>
-                              <div className="mt-1.5 space-y-1 pl-2 border-l border-gp-border">
-                                {m.agent_trace.map((tr: any, idx: number) => (
-                                  <div key={tr.execution_id || idx} className="flex flex-wrap items-center gap-1.5">
-                                    <span className="font-mono text-[10px] text-gp-ink-muted">#{tr.step_order ?? idx + 1}</span>
-                                    <span className="font-semibold text-gp-ink">{tr.tool || tr.agent}</span>
-                                    <span className="uppercase text-[9px] px-1.5 py-0.2 rounded bg-gp-surface border border-gp-border">
-                                      {tr.status}
-                                    </span>
-                                    {tr.output_summary && <span className="text-gp-ink-secondary">— {tr.output_summary}</span>}
-                                    {tr.error_details && <span className="text-red-600">— {tr.error_details}</span>}
-                                    {tr.skip_reason && <span className="text-amber-700">— {tr.skip_reason}</span>}
-                                  </div>
-                                ))}
+                      {m.agent_trace?.length > 0 && (() => {
+                        const metaEntry = [...m.agent_trace].reverse().find((tr: any) => tr.metadata?.query_category);
+                        const wfMeta = metaEntry?.metadata || null;
+                        const prohibitions: string[] = wfMeta?.action_constraints?.explicit_user_prohibitions || [];
+                        const limitations: string[] = Array.from(new Set([...(wfMeta?.missing_evidence || []), ...(wfMeta?.limitations || [])]));
+                        const evidenceSources: string[] = wfMeta?.evidence_sources || [];
+                        const toolSteps = m.agent_trace.filter((tr: any) => tr.kind === 'tool' || tr.kind === 'planner' || tr.kind === 'evaluator' || tr.kind === 'synthesizer');
+
+                        return (
+                          <div className="pt-2 border-t border-gp-divider space-y-2">
+                            <div className="flex flex-wrap items-center justify-between gap-1.5">
+                              <div className="text-[10px] font-semibold uppercase tracking-wider text-gp-ink-muted">
+                                Agent Orchestrator Trace ({m.agent_trace.length} steps)
                               </div>
-                            </details>
-                          )}
-                        </div>
-                      )}
+                              {wfMeta && (
+                                <div className="flex flex-wrap items-center gap-1 text-[10px]">
+                                  <span className="px-1.5 py-0.5 rounded bg-gp-surface border border-gp-border font-mono text-gp-ink">
+                                    {wfMeta.query_category}
+                                  </span>
+                                  <span className={`px-1.5 py-0.5 rounded border font-medium ${wfMeta.fallback_used ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-emerald-50 border-emerald-200 text-emerald-700'}`}>
+                                    {wfMeta.planner_mode === 'llm_structured'
+                                      ? `Provider: ${wfMeta.llm_provider === 'gemini' ? 'Gemini' : wfMeta.llm_provider} (${wfMeta.llm_model || wfMeta.planner_provider})`
+                                      : 'Deterministic Fallback'}
+                                  </span>
+                                  {wfMeta.synthesis_mode && (
+                                    <span className="px-1.5 py-0.5 rounded bg-gp-surface border border-gp-border text-gp-ink-secondary">
+                                      Synthesis: {wfMeta.synthesis_mode === 'llm_grounded' ? `Gemini (${wfMeta.synthesis_model || wfMeta.llm_model})` : 'Deterministic'}
+                                    </span>
+                                  )}
+                                  {prohibitions.length > 0 && (
+                                    <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-300 text-slate-700 font-medium">
+                                      Restricted: {wfMeta.action_constraints?.plan_generation_allowed ? 'Activation Blocked' : 'No Plan / Investigation Only'}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+
+                            {wfMeta?.llm_error && (
+                              <div className="text-[10px] px-2 py-1 rounded bg-amber-50 border border-amber-200 text-amber-800">
+                                LLM fallback active: {wfMeta.llm_error}
+                              </div>
+                            )}
+
+                            <div className="flex flex-wrap gap-1.5">
+                              {m.agent_trace
+                                .filter((tr: any) => !tr.kind || tr.kind === 'agent')
+                                .map((tr: any, i: number) => {
+                                  const isFailed = tr.status === 'failed';
+                                  const isSkipped = tr.status === 'skipped';
+                                  const badgeClass = isFailed
+                                    ? 'bg-red-50 border-red-200 text-red-700'
+                                    : isSkipped
+                                      ? 'bg-amber-50 border-amber-200 text-amber-700'
+                                      : 'bg-gp-primary-light border-gp-primary-border text-gp-primary';
+                                  const rationale = tr.metadata?.rationale ? ` | Rationale: ${tr.metadata.rationale}` : '';
+                                  return (
+                                    <span
+                                      key={tr.execution_id || i}
+                                      title={`${tr.status?.toUpperCase() || 'COMPLETED'}: ${tr.output_summary || tr.error_details || tr.skip_reason || tr.tool}${rationale}`}
+                                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] font-medium ${badgeClass}`}
+                                    >
+                                      <Sparkles className="w-3 h-3" />
+                                      {tr.agent}
+                                      {isSkipped && <span className="text-[9px] uppercase">[skipped]</span>}
+                                      {isFailed && <span className="text-[9px] uppercase">[failed]</span>}
+                                      {tr.duration_ms !== undefined && tr.duration_ms !== null && (
+                                        <span className="opacity-70 text-[10px]">({Math.round(tr.duration_ms)}ms)</span>
+                                      )}
+                                    </span>
+                                  );
+                                })}
+                            </div>
+
+                            {toolSteps.length > 0 && (
+                              <details className="text-[11px] text-gp-ink-secondary">
+                                <summary className="cursor-pointer hover:text-gp-primary font-medium">
+                                  View execution trace details ({m.agent_trace.length} steps, {evidenceSources.length} evidence ref(s))
+                                </summary>
+                                <div className="mt-1.5 space-y-1.5 pl-2 border-l border-gp-border">
+                                  {wfMeta?.selection_rationale && Object.keys(wfMeta.selection_rationale).length > 0 && (
+                                    <div className="text-[10px] text-gp-ink-muted">
+                                      <span className="font-semibold text-gp-ink">Selection Rationale: </span>
+                                      {Object.entries(wfMeta.selection_rationale).map(([ag, rat]) => `${ag}: ${rat}`).join(' · ')}
+                                    </div>
+                                  )}
+                                  {m.agent_trace.map((tr: any, idx: number) => (
+                                    <div key={tr.execution_id || idx} className="flex flex-wrap items-center gap-1.5">
+                                      <span className="font-mono text-[10px] text-gp-ink-muted">#{tr.step_order ?? idx + 1}</span>
+                                      {tr.kind && <span className="uppercase text-[9px] text-gp-ink-muted">[{tr.kind}]</span>}
+                                      <span className="font-semibold text-gp-ink">{tr.tool || tr.agent}</span>
+                                      <span className="uppercase text-[9px] px-1.5 py-0.2 rounded bg-gp-surface border border-gp-border">
+                                        {tr.status}
+                                      </span>
+                                      {tr.output_summary && <span className="text-gp-ink-secondary">— {tr.output_summary}</span>}
+                                      {tr.error_details && <span className="text-red-600">— {tr.error_details}</span>}
+                                      {tr.skip_reason && <span className="text-amber-700">— {tr.skip_reason}</span>}
+                                    </div>
+                                  ))}
+                                  {limitations.length > 0 && (
+                                    <div className="text-[10px] text-amber-800 pt-1">
+                                      <span className="font-semibold">Evidence Limitations: </span>
+                                      {limitations.join(' | ')}
+                                    </div>
+                                  )}
+                                </div>
+                              </details>
+                            )}
+                          </div>
+                        );
+                      })()}
 
                       {/* Confirmable State Proposal */}
                       {m.proposed_action && (

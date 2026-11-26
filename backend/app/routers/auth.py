@@ -62,7 +62,7 @@ def register(payload: UserRegisterRequest, db: Session = Depends(get_db)):
 def login(payload: UserLoginRequest, db: Session = Depends(get_db)):
     email = payload.email.strip().lower()
     user = db.query(User).filter(User.email == email).first()
-    if not user or not verify_password(payload.password, user.hashed_password):
+    if not user or not user.is_active or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
     profile = db.query(StudentProfile).filter(StudentProfile.user_id == user.id).first()

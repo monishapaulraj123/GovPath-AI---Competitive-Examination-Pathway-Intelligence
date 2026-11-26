@@ -77,10 +77,10 @@ def decode_access_token(token: str) -> dict:
         if payload.get("exp", 0) < int(time.time()):
             raise ValueError("Token expired")
         return payload
-    except Exception as exc:
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid or expired authentication token: {exc}",
+            detail="Invalid or expired authentication token",
         )
 
 

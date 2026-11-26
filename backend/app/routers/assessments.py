@@ -13,6 +13,7 @@ from app.models import (
     Competency,
     CompetencyEvidence,
     Exam,
+    ExamCompetencyRequirement,
     Question,
     SavedQuestion,
     StudentProfile,
@@ -65,6 +66,33 @@ def list_assessments(current_user: User = Depends(get_current_user), db: Session
     }
 
 
+def _interleave_by_competency(questions: list[Question]) -> list[Question]:
+    """Round-robin across competencies in first-seen order for balanced topic coverage."""
+    buckets: dict[str, list[Question]] = {}
+    for q in questions:
+        buckets.setdefault(q.competency_id, []).append(q)
+    ordered: list[Question] = []
+    idx = 0
+    while True:
+        added = False
+        for bucket in buckets.values():
+            if idx < len(bucket):
+                ordered.append(bucket[idx])
+                added = True
+        if not added:
+            break
+        idx += 1
+    return ordered
+
+
+def _extend_unique(target: list[Question], seen_ids: set[str], items: list[Question]) -> None:
+    """Append unseen questions to target in order."""
+    for item in items:
+        if item.id not in seen_ids:
+            target.append(item)
+            seen_ids.add(item.id)
+
+
 @router.post("/assessments/start")
 def start_assessment(
     payload: StartAssessmentRequest,
@@ -75,24 +103,28 @@ def start_assessment(
     if not exam:
         raise HTTPException(status_code=404, detail="Examination not found")
 
-    all_qs = db.query(Question).all()
-    # Filter by competency / subject / exam mapping with sensible fallbacks
-    pool = [q for q in all_qs if payload.exam_id in (q.exam_mappings or [])]
-    if not pool:
-        pool = all_qs
-
+    comp_obj = None
     if payload.competency_id:
-        comp_pool = [q for q in all_qs if q.competency_id == payload.competency_id]
-        if comp_pool:
-            pool = comp_pool
-    elif payload.subject_id:
-        subj_pool = [q for q in pool if q.subject_id == payload.subject_id] or [
-            q for q in all_qs if q.subject_id == payload.subject_id
-        ]
-        if subj_pool:
-            pool = subj_pool
+        comp_obj = db.query(Competency).filter(Competency.id == payload.competency_id).first()
+        if not comp_obj:
+            raise HTTPException(status_code=400, detail="Selected competency not found")
 
-    # For weak/revision mode, prioritize previously missed competencies
+    subj_obj = None
+    if payload.subject_id:
+        subj_obj = db.query(Subject).filter(Subject.id == payload.subject_id).first()
+        if not subj_obj:
+            raise HTTPException(status_code=400, detail="Selected subject not found")
+
+    all_qs = db.query(Question).all()
+    exam_mapped = [q for q in all_qs if payload.exam_id in (q.exam_mappings or [])]
+    req_cids = {
+        r.competency_id
+        for r in db.query(ExamCompetencyRequirement)
+        .filter(ExamCompetencyRequirement.exam_id == payload.exam_id)
+        .all()
+    }
+
+    missed_ids: set[str] = set()
     if payload.assessment_type == "revision":
         missed_ids = {
             a.competency_id
@@ -101,15 +133,57 @@ def start_assessment(
             .filter(AssessmentAttempt.user_id == current_user.id, AttemptAnswer.is_correct == False)
             .all()
         }
-        weak_pool = [q for q in pool if q.competency_id in missed_ids]
-        if weak_pool:
-            pool = weak_pool + [q for q in pool if q not in weak_pool]
 
-    selected = pool[: payload.question_count]
-    if len(selected) < min(payload.question_count, len(all_qs)):
-        extras = [q for q in all_qs if q not in selected]
-        random.shuffle(extras)
-        selected.extend(extras[: payload.question_count - len(selected)])
+    selection_note: Optional[str] = None
+    seen_ids: set[str] = set()
+    pool: list[Question] = []
+
+    if payload.competency_id:
+        # Strict competency isolation: prefer exam-mapped items, complete only from same competency.
+        _extend_unique(pool, seen_ids, [q for q in exam_mapped if q.competency_id == payload.competency_id])
+        _extend_unique(pool, seen_ids, [q for q in all_qs if q.competency_id == payload.competency_id])
+        if not pool:
+            raise HTTPException(status_code=404, detail="No questions available for the selected competency")
+        selected = pool[: payload.question_count]
+        if len(selected) < payload.question_count:
+            selection_note = (
+                f"Delivered {len(selected)} of {payload.question_count} requested questions to keep strict focus on {comp_obj.name}."
+            )
+    elif payload.subject_id:
+        # Strict subject isolation: diversify across competencies in that subject, never pad with other subjects.
+        _extend_unique(pool, seen_ids, [q for q in exam_mapped if q.subject_id == payload.subject_id])
+        _extend_unique(pool, seen_ids, [q for q in all_qs if q.subject_id == payload.subject_id])
+        if not pool:
+            raise HTTPException(status_code=404, detail="No questions available for the selected subject")
+        if missed_ids:
+            weak_pool = [q for q in pool if q.competency_id in missed_ids]
+            rest_pool = [q for q in pool if q.competency_id not in missed_ids]
+            pool = weak_pool + rest_pool
+        selected = pool[: payload.question_count]
+        if len(selected) < payload.question_count:
+            selection_note = (
+                f"Delivered {len(selected)} of {payload.question_count} requested questions to keep strict focus on {subj_obj.name}."
+            )
+    else:
+        # Exam-wide diagnostic / mock / revision: prioritize syllabus-required competencies mapped to this exam,
+        # interleaved across competencies before repeating any competency.
+        tier_primary = [q for q in exam_mapped if not req_cids or q.competency_id in req_cids]
+        tier_req_other_exam = [q for q in all_qs if q.competency_id in req_cids and q not in tier_primary]
+        tier_exam_extra = [q for q in exam_mapped if q not in tier_primary]
+
+        if missed_ids:
+            weak_primary = [q for q in tier_primary + tier_req_other_exam if q.competency_id in missed_ids]
+            rest_primary = [q for q in tier_primary if q.competency_id not in missed_ids]
+            rest_req = [q for q in tier_req_other_exam if q.competency_id not in missed_ids]
+            _extend_unique(pool, seen_ids, _interleave_by_competency(weak_primary))
+            _extend_unique(pool, seen_ids, _interleave_by_competency(rest_primary))
+            _extend_unique(pool, seen_ids, _interleave_by_competency(rest_req))
+        else:
+            _extend_unique(pool, seen_ids, _interleave_by_competency(tier_primary))
+            _extend_unique(pool, seen_ids, _interleave_by_competency(tier_req_other_exam))
+        _extend_unique(pool, seen_ids, _interleave_by_competency(tier_exam_extra))
+        _extend_unique(pool, seen_ids, all_qs)
+        selected = pool[: payload.question_count]
 
     type_titles = {
         "diagnostic": f"{exam.short_name} Diagnostic Assessment",
@@ -119,7 +193,11 @@ def start_assessment(
         "revision": f"{exam.short_name} Spaced Revision Check",
     }
     title = type_titles.get(payload.assessment_type, f"{exam.short_name} Assessment")
-    time_limit = payload.time_limit_sec or (len(selected) * 75)
+    if comp_obj:
+        title += f" · {comp_obj.name}"
+    elif subj_obj:
+        title += f" · {subj_obj.name}"
+    time_limit = payload.time_limit_sec or max(180, len(selected) * 75)
 
     attempt = AssessmentAttempt(
         user_id=current_user.id,
@@ -146,6 +224,7 @@ def start_assessment(
         "assessment_type": attempt.assessment_type,
         "title": attempt.title,
         "time_limit_sec": attempt.time_limit_sec,
+        "selection_note": selection_note,
         "questions": [
             {
                 "id": q.id,
